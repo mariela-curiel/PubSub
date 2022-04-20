@@ -1,0 +1,229 @@
+// Autor: Mariela Curiel
+// Descripcion: ejemplo de un productor consumidor, el proceso central 
+// va leyendo los registros del pipe y los coloca en un buffer. Un
+// hilo va sacando los elementos del buffer y los imprime. 
+// en el proyecto,  el hilo debería escribir en la copia de la BD que está 
+// en la memoria las actualizaciones correspondientes a las operaciones de renovacion o devolucion. 
+
+   // Se recibe el pipe al suscriptor de primer argumento y el pipe al publicador de segundo
+ 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include "nom.h" 
+
+// El tamaño del BUFFER debe ser una constante. La idea es poder modificar ese tamaño el dia de la 
+// sustentacion
+
+#define TAMBUF 8
+
+//Variables globales para la implementación del buffer
+
+newp BUFFER[TAMBUF]; // buffer donde se pondrán las noticias para consumo inmedito. Si no hay suscriptores se guarda la ultima en el buffer auxiliar
+newp LASTNEW[2]; // buffer donde se guarda la última noticia de cada tópico. 
+int globalfd[NSUSCR]; // se guardan los file descriptor de los pipes asociados a los suscriptores.
+topicos suscr[NSUSCR]; // topicos y pid de cada suscriptor.
+
+
+int pcons=0, pprod=0;
+sem_t s, espacios, elementos; // semaforos para la implementacion del buffer
+
+
+void *take(newp *);
+void *put(newp *);
+void Publicador(int *fd);
+
+
+
+void Publicador(int *fd) {
+
+  int cuantos; 
+  newp new;
+ 
+ do {
+    cuantos = read (*fd, &new, sizeof(newp)); // recordar validar llamadas al sistema
+    if (cuantos == 0) break;
+    printf (" El central leyó  %d %s, cuantos = %d \n", new.topico, new.noticia, cuantos);
+    put(&new);
+  } while (cuantos > 0);
+ 
+  new.topico = -1;
+  put(&new);
+  printf("Se terminan de leer las noticias del Publicador");
+  pthread_exit(NULL);
+}
+
+void BuscarUltima(int pos, int topico) {
+     
+  if (LASTNEW[topico - 1].topico != -1) {
+     write(globalfd[pos], LASTNEW[topico -1].noticia, strlen(LASTNEW[topico -1].noticia) + 1);
+
+  }  
+
+}  
+
+void ColocarSuscriptor(int topico, char *noticia) {
+
+  int i=0, salir=0;
+
+  printf("ColocarS recibe %d y %s\n", topico, noticia);
+  if (globalfd[0] == -1) { // No hay suscriptor creado, se guarda la noticia en el arreglo de dos posiciones
+      LASTNEW[topico-1].topico = topico;
+      strcpy(LASTNEW[topico-1].noticia, noticia);
+      
+  } else {
+
+    // Enviar la noticia por el pipe correspondiente.
+    while (salir == 0) {       
+      if (suscr[i].topico == topico) { // enviar la noticia por el pipe correspondiente
+         write(globalfd[i], noticia, strlen(noticia) + 1);
+
+      }
+      i++;
+      if (globalfd[i] == -1) salir = 1;
+
+     }
+}
+
+}  
+
+
+// Funcion para tomar datos del buffer
+void *take(newp *e) {
+
+  newp temp,*pe;
+
+  pe = e; //pe ahora apunta al buffer
+  int i=0;
+
+  for (;;) {
+    
+    sem_wait(&elementos);
+    sem_wait(&s);
+    memcpy(&temp, &pe[pcons], sizeof(newp));
+    pe[pcons].topico = 0; // para indicar que la posición está vacia
+    pcons= (pcons + 1) % TAMBUF;
+    if (temp.topico  == -1) { // el ultimo elemento
+      sem_post(&s);
+      sem_post(&espacios);
+      break;
+    } else {
+      // Se imprime el elemento que se toma del buffer
+      //printf (" Thread leyo %d %s\n", temp.topico, temp.noticia);
+      ColocarSuscriptor(temp.topico, temp.noticia);
+      sem_post(&s);
+      sem_post(&espacios);
+    }  
+    
+  }
+  printf("thread consumidor termina\n");
+  pthread_exit(NULL);
+  
+
+}  
+
+// Funcion para colocar elementos del buffer. 
+void *put(newp *e) {
+      sem_wait(&espacios);
+      sem_wait(&s);
+      if (BUFFER[pprod].topico == 0) 
+	memcpy(&BUFFER[pprod], e, sizeof(newp));
+      pprod = (pprod + 1) % TAMBUF;
+      sem_post(&s);
+      sem_post(&elementos);
+}  
+
+
+int main (int argc, char **argv)
+{
+  int fd, fd1, pid, n, bytes, cuantos, creado,i, abiertos;
+  datap datos;
+  pthread_t thread[3];
+ 
+   
+  mode_t fifo_mode = S_IRUSR | S_IWUSR;
+
+  // inicializacion de los semáforos siguiendo el algoritmo productor, consumidor
+  sem_init(&s, 0, 1);
+  sem_init(&espacios, 0, TAMBUF);
+  sem_init(&elementos, 0, 0);
+  
+  // inicializacion de las estructuras de datos globales compartidas
+  
+  for (i=0; i < TAMBUF; i++) BUFFER[i].topico = 0;
+  for (i=0; i < NSUSCR; i++) globalfd[i] = -1;
+  for (i=0; i < NSUSCR; i++) suscr[i].topico = -1;
+   for (i=0; i < 2; i++) LASTNEW[i].topico = -1;
+  
+ 
+// Creacion del pipe del lado del publicador
+    if (mkfifo (argv[2], fifo_mode) == -1) {
+        perror("mkfifo");
+        exit(1);
+    }  
+
+     fd1 = open (argv[2], O_RDONLY);
+     if (fd1 == -1) {
+         perror("pipe publicador");
+         exit (0);
+      }
+
+     if (mkfifo (argv[1], fifo_mode) == -1) {
+        perror("mkfifo");
+        exit(1);
+     }
+
+     fd = open (argv[1], O_RDONLY);
+     if (fd == -1) {
+       perror("pipe suscriptor");
+       exit (0);
+     }
+
+     
+      pthread_create(&thread[0], NULL, (void*) Publicador, (void*)&fd1);
+        
+      pthread_create(&thread[1], NULL, (void*) take, (void*)BUFFER);      
+
+      
+     // El hilo principal se queda leyendo del pipe de los suscriptores.     
+  
+    
+
+    for(i=0;;i++) { 
+       cuantos = read (fd, &datos, sizeof(datos));
+       if (cuantos == -1) {
+          perror("Sistema Central:");
+          exit(1);
+       }
+       if (cuantos == 0) break;
+       //printf ("Central lee el string %s\n", datos.segundopipe);
+       //printf ("Central el pid %d y topico %d \n", datos.pid, datos.topico);
+
+       do { 
+          if ((globalfd[i] = open(datos.segundopipe, O_WRONLY)) == -1) {
+             perror(" Server Abriendo el segundo pipe ");
+             printf(" Se volvera a intentar despues\n");
+             sleep(5); //los unicos sleeps que deben colocar son los que van en los ciclos para abrir los pipes.         
+          } else creado = 1; 
+       }  while (creado == 0);
+       suscr[i].pid = datos.pid;
+       suscr[i].topico = datos.topico;
+       //BuscarUltima(i,suscr[i].topico);
+    } // Fin del ciclo infinito
+    abiertos = i;    
+
+  // Cerrar y eliminar el pipe
+    printf("El numero de  pipes abiertos es %d\n", abiertos);
+    for (int i=0; i < abiertos; i++) close(globalfd[i]);
+    close(fd);
+    close(fd1);
+    unlink(argv[1]);
+    unlink(argv[2]);
+}
